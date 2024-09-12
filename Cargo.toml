@@ -1,0 +1,11 @@
+[package]
+name = "mssetup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.88"
+clap = { version = "4.5.17", features = ["derive"] }
+memchr = "2.7.4"
+zip = "2.2.0"
+zipunsplitlib = { git = "https://github.com/jon-zu/zipunsplit"}
