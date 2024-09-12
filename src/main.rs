@@ -82,8 +82,8 @@ impl<R: Read + Seek> Setup<R> {
             limited.read_line(&mut line)?;
 
             let line = line.trim();
-            let (name, rest) = line.split_once(',').unwrap();
-            let (checksum, size) = rest.split_once(',').unwrap();
+            let (name, rest) = line.split_once(',').context("Invalid entry name")?;
+            let (checksum, size) = rest.split_once(',').context("Invalid entry size")?;
             entries.push(SetupEntry {
                 name: name.trim_matches('"').to_string(),
                 size: size.trim_matches('"').parse::<i32>()?,
@@ -146,7 +146,7 @@ fn extract_zip_split(paths: Vec<PathBuf>, setup_dir: impl AsRef<Path>) -> anyhow
     let joined_file = JoinedFile::new(JoinedOpener(paths))?;
     let split_ranges = joined_file.splits();
     let mut cow_file = MemoryCowFile::new(joined_file, 4096)?;
-    zipunsplitlib::split::fix_offsets(&mut cow_file, &split_ranges).unwrap();
+    zipunsplitlib::split::fix_offsets(&mut cow_file, &split_ranges).context("Fix offsets")?;
     cow_file.rewind()?;
 
     let mut archive = zip::ZipArchive::new(cow_file)?;
