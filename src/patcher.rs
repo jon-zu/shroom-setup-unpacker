@@ -194,7 +194,7 @@ impl WzPatchHandler for WzPatcher {
 pub struct WzPatcherInfo {
     pub added_files: Vec<(String, usize)>,
     pub removed_files: Vec<String>,
-    pub modified_files: Vec<(String, usize)>,
+    pub modified_files: Vec<(String, usize, usize)>,
 }
 
 impl WzPatchHandler for WzPatcherInfo {
@@ -218,11 +218,12 @@ impl WzPatchHandler for WzPatcherInfo {
         _old_checksum: u32,
         _new_checksum: u32,
     ) -> anyhow::Result<()> {
-        self.modified_files.push((p.0.clone(), 0));
+        self.modified_files.push((p.0.clone(), 0, 0));
         Ok(())
     }
 
     fn handle_mod_repeat(&mut self, _byte: u8, _len: u32) -> anyhow::Result<()> {
+        self.modified_files.last_mut().unwrap().2 += _len as usize;
         self.modified_files.last_mut().unwrap().1 += _len as usize;
         Ok(())
     }
@@ -231,6 +232,7 @@ impl WzPatchHandler for WzPatcherInfo {
         &mut self,
         data: &mut crate::patch::WzPatchDataStream<R>,
     ) -> anyhow::Result<()> {
+        self.modified_files.last_mut().unwrap().2 += data.len() as usize;
         self.modified_files.last_mut().unwrap().1 += data.len() as usize;
         Ok(())
     }

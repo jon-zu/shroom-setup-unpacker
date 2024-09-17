@@ -217,7 +217,7 @@ fn list_patcher(p: impl AsRef<Path>) -> anyhow::Result<()> {
 
     log::info!("Modified");
     for entry in info.modified_files.iter() {
-        log::info!("\t{} - {}", entry.0, SizeFormatter::new(entry.1, DECIMAL));
+        log::info!("\t{} - {}({})", entry.0, SizeFormatter::new(entry.2, DECIMAL), SizeFormatter::new(entry.1, DECIMAL));
     }
 
     log::info!("Deleted");
