@@ -1,204 +1,375 @@
+pub mod extract;
+pub mod setup;
+pub mod util;
+pub mod patch;
+pub mod patcher;
+
 use std::{
+    collections::HashSet,
     fs::File,
-    io::{self, BufRead, BufReader, BufWriter, Read, Seek, Take},
-    path::{Path, PathBuf}, process::Command,
+    io::{BufReader, BufWriter, Read},
+    path::{Path, PathBuf},
 };
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use clap::Parser;
-use zipunsplitlib::file::{JoinedFile, MemoryCowFile, Opener};
+use extract::{extract_cab_split, extract_zip_split};
+use humansize::{SizeFormatter, DECIMAL};
+use patch::WzPatch;
+use patcher::WzPatcherInfo;
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use setup::{is, nfo300, Entry, Setup};
+use util::{get_all_nested_files, SetupFormat};
 
-fn find_magic<R: Read>(mut reader: R, magic: &[u8]) -> anyhow::Result<Option<u64>> {
-    use memchr::memmem::Finder;
-    const BUF_SIZE: usize = 4096;
-    assert!(magic.len() <= BUF_SIZE);
-    let mut buffer = [0; BUF_SIZE]; // Buffer size of 4096 bytes
-    let mut offset = 0;
-    let overlap = magic.len() - 1;
-    let mut n = overlap;
-
-    let finder = Finder::new(magic);
-    loop {
-        let read = reader.read(&mut buffer[n..])?;
-        if read == 0 {
-            break;
-        }
-
-        n += read;
-        if n < magic.len() {
-            continue;
-        }
-
-        if let Some(pos) = finder.find(&buffer[..n]) {
-            return Ok(Some(offset + pos as u64 - overlap as u64));
-        }
-
-        offset += n as u64 - overlap as u64;
-
-        // Copy the last `overlap` bytes to the start of the buffer
-        buffer.copy_within(n - overlap..n, 0);
-        n = overlap;
-    }
-
-    Ok(None)
+fn systemtime_strftime<T>(dt: T) -> String
+where
+    T: Into<DateTime<Utc>>,
+{
+    let datetime: DateTime<Utc> = dt.into();
+    datetime.format("%d/%m/%Y %T").to_string()
 }
 
-#[derive(Debug)]
-pub struct SetupEntry {
-    pub name: String,
-    pub size: i32,
-    pub checksum: i32,
-    pub offset: u64,
+pub enum SetupOpt {
+    Nfo300(nfo300::Nfo300Setup<BufReader<File>>, PathBuf),
+    Is(is::IsSetup<BufReader<File>>, PathBuf),
 }
 
-pub struct Setup<R> {
-    reader: R,
-    nfo_offset: u64,
-}
-
-impl<R: Read + Seek> Setup<R> {
-    pub fn new(mut reader: R) -> anyhow::Result<Self> {
-        let nfo_offset = find_magic(&mut reader, b"NFO300")?.context("NFO300 not found")?;
-        Ok(Self { reader, nfo_offset })
+impl SetupOpt {
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let mut rdr = BufReader::new(File::open(path.as_ref())?);
+        match SetupFormat::from_reader(rdr.by_ref())? {
+            SetupFormat::NFO300(offset) => {
+                let setup = nfo300::Nfo300Setup::new(rdr, offset)?;
+                Ok(Self::Nfo300(setup, path.as_ref().to_path_buf()))
+            }
+            SetupFormat::InstallShield(offset) => {
+                let setup = is::IsSetup::new(rdr, offset)?;
+                Ok(Self::Is(setup, path.as_ref().to_path_buf()))
+            }
+        }
     }
 
-    pub fn entries(&mut self) -> anyhow::Result<Vec<SetupEntry>>
-    where
-        R: BufRead,
-    {
-        self.reader
-            .seek(std::io::SeekFrom::Start(self.nfo_offset))?;
-        let mut entries = vec![];
-        let mut line = String::new();
+    fn path(&self) -> &Path {
+        match self {
+            Self::Nfo300(_, path) => path,
+            Self::Is(_, path) => path,
+        }
+    }
 
-        let mut limited = self.reader.by_ref().take(1000);
+    fn extract_setup(&mut self, tmp_dir: &Path, out_dir: &Path) -> anyhow::Result<()> {
+        // Extract all entries to a temporary directory
+        let out = match self {
+            Self::Nfo300(setup, _) => setup.extract_to(tmp_dir),
+            Self::Is(setup, _) => setup.extract_to(tmp_dir),
+        }
+        .context("Extracing entries")?;
 
-        // Skip nfo line
-        limited.read_line(&mut line)?;
+        let exts = out
+            .iter()
+            .filter_map(|p| p.extension())
+            .filter_map(|s| s.to_str())
+            .collect::<HashSet<_>>();
+        if exts.contains(&"cab") {
+            extract_cab_split(out, out_dir)?;
+        } else if exts.contains(&"zip") || exts.contains(&"z0") {
+            extract_zip_split(out, out_dir)?;
+        } else if exts.contains(&"msi") {
+            let msi = out
+                .iter()
+                .find(|p| p.extension().and_then(|s| s.to_str()) == Some("msi"))
+                .unwrap();
+            let tmp_msi = tmp_dir.join("msi");
+            std::fs::create_dir(&tmp_msi)?;
+            extract::extract_msi(msi, &tmp_msi)?;
 
-        // Read as long as the line starts with a quote
-        while limited.fill_buf()?[0] == b'"' {
-            line.clear();
-            limited.read_line(&mut line)?;
-
-            let line = line.trim();
-            let (name, rest) = line.split_once(',').context("Invalid entry name")?;
-            let (checksum, size) = rest.split_once(',').context("Invalid entry size")?;
-            entries.push(SetupEntry {
-                name: name.trim_matches('"').to_string(),
-                size: size.trim_matches('"').parse::<i32>()?,
-                checksum: checksum.trim_matches('"').parse::<i32>()?,
-                offset: 0,
-            });
+            let data_cab = tmp_msi.join("Data1.cab");
+            extract_cab_split(vec![data_cab], out_dir)?;
+        } else {
+            anyhow::bail!("Unknown archive format: {:?}", exts);
         }
 
-        let mut data_offset = self.reader.seek(std::io::SeekFrom::Current(0))?;
-        for entry in &mut entries {
-            entry.offset = data_offset;
-            data_offset += entry.size as u64;
+        Ok(())
+    }
+
+    fn list_archives(&mut self) -> anyhow::Result<()> {
+        log::info!("Listing archives for: {}", self.path().display());
+        match self {
+            Self::Nfo300(setup, _) => Self::list_archives_inner(setup),
+            Self::Is(setup, _) => Self::list_archives_inner(setup),
+        }
+    }
+
+    fn list_archives_inner(mut setup: impl Setup) -> anyhow::Result<()> {
+        match setup.entries() {
+            Ok(entries) => {
+                for entry in entries.iter() {
+                    log::info!(
+                        "{} - {}",
+                        entry.name(),
+                        SizeFormatter::new(entry.size(), DECIMAL)
+                    );
+                }
+
+                let total: u64 = entries.iter().map(|e| e.size()).sum();
+                let sz = setup.size();
+                let perc = (total as f64 / sz as f64) * 100.0;
+                log::info!(
+                    "Total: {}/{} ({perc:.2}%)",
+                    SizeFormatter::new(total, DECIMAL),
+                    SizeFormatter::new(sz, DECIMAL)
+                );
+            }
+            Err(e) => log::error!("Error: {}", e),
         }
 
-        Ok(entries)
+        Ok(())
     }
 
-    pub fn entry_reader(&mut self, entry: &SetupEntry) -> anyhow::Result<BufReader<Take<&mut R>>> {
-        self.reader.seek(std::io::SeekFrom::Start(entry.offset))?;
-        Ok(BufReader::new(self.reader.by_ref().take(entry.size as u64)))
-    }
-
-    pub fn extract_entries_to(
+    fn extract_and_report(
         &mut self,
-        entries: &[SetupEntry],
+        id: usize,
+        remove_prefix: &[String],
+        remove_exts: &[String],
         out_dir: &Path,
-    ) -> anyhow::Result<Vec<PathBuf>> {
-        let mut paths = vec![];
-        for entry in entries {
-            let mut reader = self.entry_reader(entry)?;
+        keep_tmp: bool,
+    ) -> anyhow::Result<()> {
+        let name = self.path().file_stem().context("Invalid setup path")?;
+        let out_dir = out_dir.join(name);
 
-            // Ensure the path name contains only letters, digits and dots
-            let name = entry
-                .name
-                .replace(|c: char| !c.is_ascii_alphanumeric() && c != '.', "_");
-            let out_path = out_dir.join(&name);
-            let mut out = BufWriter::new(File::create(&out_path)?);
-            io::copy(&mut reader, &mut out)?;
-
-            paths.push(out_path);
+        let tmp_dir = std::env::temp_dir().join(format!("mssetupx{id}"));
+        // Ensure it's clean
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir)?;
+        std::fs::create_dir_all(&out_dir).context("Create out dir")?;
+        self.extract_setup(&tmp_dir, &out_dir)?;
+        Self::create_report_and_clean_up(&out_dir, remove_prefix, remove_exts)?;
+        if !keep_tmp {
+            std::fs::remove_dir_all(tmp_dir)?;
         }
 
-        Ok(paths)
+        Ok(())
+    }
+
+    fn create_report_and_clean_up(
+        dir: &Path,
+        remove_prefix: &[String],
+        remove_exts: &[String],
+    ) -> anyhow::Result<()> {
+        use std::io::Write;
+        let entries = get_all_nested_files(dir)?;
+
+        // Create report
+        let report = dir.join("report.txt");
+        let mut report = BufWriter::new(File::create(&report)?);
+        for entry in entries.iter() {
+            let meta = entry.metadata()?;
+            let name = entry.file_name().unwrap().to_string_lossy();
+            let acc = systemtime_strftime(meta.accessed().unwrap());
+            let cre = systemtime_strftime(meta.created().unwrap());
+
+            writeln!(
+                report,
+                "{} - {} - {cre} - {acc}",
+                name,
+                SizeFormatter::new(meta.len(), DECIMAL)
+            )?;
+        }
+
+        for entry in entries.iter() {
+            let name = entry.file_name().unwrap().to_string_lossy();
+            let name = name.to_string();
+
+            #[allow(clippy::search_is_some)]
+            let has_prefix = remove_prefix
+                .iter()
+                .find(|p| name.starts_with(p.as_str()))
+                .is_some();
+
+            #[allow(clippy::search_is_some)]
+            let has_ext = remove_exts
+                .iter()
+                .find(|e| entry.extension().and_then(|s| s.to_str()) == Some(e))
+                .is_some();
+
+            if has_prefix || has_ext {
+                if let Err(err) = std::fs::remove_file(entry) {
+                    log::error!("Error Deleting File({}): {err}", entry.display());
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
-pub struct JoinedOpener(pub Vec<PathBuf>);
+fn list_patcher(p: impl AsRef<Path>) -> anyhow::Result<()> {
+    let mut patcher = WzPatch::open(&p)?;
+    let mut info = WzPatcherInfo::default();
+    patcher.process(&mut info)?;
 
-impl Opener for JoinedOpener {
-    fn open_split(&mut self, index: usize) -> io::Result<File> {
-        Ok(File::open(&self.0[index])?)
+    log::info!("Patcher: {}", p.as_ref().display());
+    log::info!("Version: {}", patcher.version());
+    log::info!("Added");
+    for entry in info.added_files.iter() {
+        log::info!("\t{} - {}", entry.0, SizeFormatter::new(entry.1, DECIMAL));
     }
 
-    fn num_splits(&self) -> usize {
-        self.0.len()
+    log::info!("Modified");
+    for entry in info.modified_files.iter() {
+        log::info!("\t{} - {}", entry.0, SizeFormatter::new(entry.1, DECIMAL));
     }
-}
 
-fn extract_zip_split(paths: Vec<PathBuf>, setup_dir: impl AsRef<Path>) -> anyhow::Result<()> {
-    let joined_file = JoinedFile::new(JoinedOpener(paths))?;
-    let split_ranges = joined_file.splits();
-    let mut cow_file = MemoryCowFile::new(joined_file, 4096)?;
-    zipunsplitlib::split::fix_offsets(&mut cow_file, &split_ranges).context("Fix offsets")?;
-    cow_file.rewind()?;
+    log::info!("Deleted");
+    for entry in info.removed_files.iter() {
+        log::info!("\t{}", entry);
+    }
 
-    let mut archive = zip::ZipArchive::new(cow_file)?;
-    //TODO create HShield directory
-    archive.extract(setup_dir)?;
-
-    Ok(())
-}
-
-fn extract_cab_split(paths: Vec<PathBuf>, setup_dir: impl AsRef<Path>) -> anyhow::Result<()> {
-    // Use cabextract
-    //TODO maybe use 
-    Command::new("cabextract")
-        .args(&["-d", setup_dir.as_ref().to_str().unwrap()])
-        .args(paths.iter().map(|p| p.to_str().unwrap()))
-        .output()?;
 
     Ok(())
 }
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct Args {
-    /// The setup file to extract
-    #[arg(short, long)]
-    setup: String,
+enum Args {
+    Extract {
+        /// The setup file to extract
+        #[arg(short, long)]
+        setup: String,
 
-    /// The setup directory
-    #[arg(short, long, default_value = "setup")]
-    dir: String,
+        /// The setup directory
+        #[arg(short, long, default_value = "setup")]
+        dir: String,
+
+        /// Keep the tmp dir
+        #[arg(short, long, default_value = "false")]
+        keep_tmp: bool,
+    },
+    ExtractAll {
+        #[arg(short, long)]
+        setup_glob: String,
+        #[arg(
+            long,
+            default_value = "",
+            use_value_delimiter = true,
+            value_delimiter = ','
+        )]
+        remove_prefix: Vec<String>,
+        #[arg(
+            long,
+            default_value = "",
+            use_value_delimiter = true,
+            value_delimiter = ','
+        )]
+        remove_exts: Vec<String>,
+        #[arg(short, long)]
+        out_dir: String,
+        #[arg(short, long, default_value = "4")]
+        threads: usize,
+        /// Keep the tmp dir
+        #[arg(short, long, default_value = "false")]
+        keep_tmp: bool,
+    },
+    ListArchives {
+        /// The setup file to list
+        #[arg(short, long)]
+        setup: String,
+    },
+    ListAllArchives {
+        /// The setup file to list
+        #[arg(short, long)]
+        setup_glob: String,
+    },
+    ListPatcher {
+        /// The patcher file to list
+        #[arg(short, long)]
+        patcher: String,
+    },
+    ListAllPatchers {
+        /// The patcher file to list
+        #[arg(short, long)]
+        patcher_glob: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
+    simplelog::TermLogger::init(
+        simplelog::LevelFilter::Info,
+        simplelog::Config::default(),
+        simplelog::TerminalMode::Mixed,
+        simplelog::ColorChoice::Auto,
+    )?;
+
     let args = Args::parse();
-    let r = BufReader::new(std::fs::File::open(args.setup)?);
-    let mut setup = Setup::new(r)?;
 
-    // Extract all entries to a temporary directory
-    let entries = setup.entries()?;
-    let tmp_dir = std::env::temp_dir().join("mssetupx");
-    std::fs::remove_dir_all(&tmp_dir).ok();
-    std::fs::create_dir(&tmp_dir).context("Tmp dir")?;
-    let out = setup.extract_entries_to(&entries, &tmp_dir)?;
-
-    let is_zip = out.iter().any(|p| p.extension().unwrap() == "zip");
-    if is_zip {
-        extract_zip_split(out, args.dir)?;
-    } else {
-        extract_cab_split(out, args.dir)?;
+    match args {
+        Args::Extract {
+            setup,
+            dir,
+            keep_tmp,
+        } => {
+            let mut setup = SetupOpt::open(&setup)?;
+            if let Err(err) = setup.extract_and_report(0, &[], &[], Path::new(&dir), keep_tmp) {
+                log::error!("Error: {err} for: {}", setup.path().display());
+            }
+        }
+        Args::ListArchives { setup } => {
+            let mut setup = SetupOpt::open(&setup)?;
+            setup.list_archives()?;
+        }
+        Args::ListAllArchives { setup_glob } => {
+            let paths = glob::glob(&setup_glob)?.collect::<Result<Vec<_>, _>>()?;
+            for path in paths {
+                let mut setup = SetupOpt::open(&path)?;
+                setup.list_archives()?;
+            }
+        }
+        Args::ExtractAll {
+            setup_glob,
+            remove_prefix,
+            remove_exts,
+            out_dir,
+            threads,
+            keep_tmp
+        } => {
+            let _ = std::fs::create_dir_all(&out_dir);
+            let paths = glob::glob(&setup_glob)?.collect::<Result<Vec<_>, _>>()?;
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .unwrap();
+            paths
+                .iter()
+                .enumerate()
+                .par_bridge()
+                .for_each(|(id, path)| {
+                    if let Err(err) = SetupOpt::open(path).and_then(|mut setup| {
+                        setup.extract_and_report(
+                            id,
+                            &remove_prefix,
+                            &remove_exts,
+                            Path::new(&out_dir),
+                            keep_tmp
+                        )
+                    }) {
+                        log::error!("Error: {} for: {}", err, path.display());
+                    }
+                });
+        },
+        Args::ListPatcher { patcher } => {
+            if let Err(err) = list_patcher(&patcher) {
+                log::error!("Error: {err} for: {}", patcher);
+            }
+        },
+        Args::ListAllPatchers { patcher_glob } => {
+            let paths = glob::glob(&patcher_glob)?.collect::<Result<Vec<_>, _>>()?;
+            for path in paths {
+                if let Err(err) = list_patcher(&path) {
+                    log::error!("Error: {err} for: {}", path.display());
+                }
+            }
+        }
     }
-
-    std::fs::remove_dir_all(&tmp_dir)?;
 
     Ok(())
 }

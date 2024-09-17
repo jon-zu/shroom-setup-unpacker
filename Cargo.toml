@@ -5,7 +5,22 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.88"
+binrw = "0.14.0"
+bitflags = "2.6.0"
+bytemuck = { version = "1.18.0", features = ["derive"] }
+bzip2 = "0.4.4"
+chrono = "0.4.38"
 clap = { version = "4.5.17", features = ["derive"] }
+crc = "3.2.1"
+flate2 = "1.0.33"
+glob = "0.3.1"
+humansize = "2.1.3"
+log = "0.4.22"
 memchr = "2.7.4"
+msi = "0.8.0"
+rayon = "1.10.0"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+simplelog = "0.12.2"
 zip = "2.2.0"
 zipunsplitlib = { git = "https://github.com/jon-zu/zipunsplit"}
